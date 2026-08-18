@@ -26,65 +26,17 @@
 	</div>
 	<!-- tile stats panel, revealed by the Odin scheduler once the block finishes loading -->
 	<pre id="stats" hidden></pre>
-
-	<!-- Tile decode worker (one instance per pool slot). NOT executed inline: the type is
-	     non-JS so the browser skips it; the main script reads its textContent verbatim and
-	     spins Workers from a Blob URL. Verbatim read = regexes survive (no template-literal
-	     escape mangling). Fetches + decodes a tile fully off the main thread, then transfers
-	     the decoded frame back for GPU upload. performance.now() deltas here are durations
-	     within this context only -- valid as ms, not comparable to main-thread timestamps. -->
-	<script type="text/js-worker" id="tile-worker">
-		self.onmessage = async (e) => {
-			const { id, url } = e.data;
-			const t0 = performance.now();
-			try {
-				const r = await fetch(url, { cache: "no-store" });
-				if (!r.ok) throw r.status;
-				const buf = await r.arrayBuffer();
-				const tFetch = performance.now() - t0;
-				const bytes = buf.byteLength;
-				const data = new Uint8Array(buf);
-
-				// Pick a mime type ImageDecoder understands: response header, else URL extension.
-				let type = "";
-				const ct = r.headers.get("content-type");
-				if (ct && ct.startsWith("image/")) type = ct.split(";")[0].trim();
-				if (!type) {
-					if (/\.avif(\?|$)/i.test(url)) type = "image/avif";
-					else if (/\.jpe?g(\?|$)/i.test(url)) type = "image/jpeg";
-					else if (/\.png(\?|$)/i.test(url)) type = "image/png";
-					else if (/\.webp(\?|$)/i.test(url)) type = "image/webp";
-				}
-
-				let useDecoder = false;
-				if (type && ("ImageDecoder" in self)) {
-					try { useDecoder = await ImageDecoder.isTypeSupported(type); } catch (_) { useDecoder = false; }
-				}
-
-				const t1 = performance.now();
-				let frame;
-				if (useDecoder) {
-					// Native codec threads (dav1d for AVIF, no wasm). Yields a VideoFrame (BGRA8).
-					const dec = new ImageDecoder({ data, type });
-					frame = (await dec.decode()).image;
-					dec.close();
-				} else {
-					// Fallback: createImageBitmap (also available in workers). Same color flags
-					// as the original main-thread path -- raw sRGB bytes, no ICC/color mgmt.
-					const blob = new Blob([data], { type: type || undefined });
-					frame = await createImageBitmap(blob,
-						{ colorSpaceConversion: "none", premultiplyAlpha: "none", imageOrientation: "none" });
-				}
-				const decodeMs = performance.now() - t1;
-
-				// Transfer the frame handle (not a pixel copy) back to main for upload.
-				self.postMessage({ id, ok: 1, bytes, tFetch, decodeMs, frame }, [frame]);
-			} catch (err) {
-				self.postMessage({ id, ok: 0, err: String(err) });
+	<script>
+		// mark the active source and wire the buttons to reload with the query param
+		(() => {
+			const raw = new URLSearchParams(location.search).get("src");
+			const cur = (raw === "jpeg" || raw === "jpeg-cdn") ? raw : "avif";
+			for (const b of document.querySelectorAll("#ab button")) {
+				if (b.dataset.src === cur) b.classList.add("active");
+				b.onclick = () => { location.search = "?src=" + b.dataset.src; };
 			}
-		};
+		})();
 	</script>
-
 	<!-- Odin js_wasm32 runtime: runWasm + WasmMemoryInterface (attached to window.odin) -->
 	<script src="odin.js"></script>
 	<!-- vendor:wgpu web backend: WebGPUInterface (browser WebGPU), also on window.odin -->
@@ -104,23 +56,13 @@
 		const memory = new WebAssembly.Memory({ initial: 1024, maximum: 16384 });
 		wmi.setMemory(memory);
 
-		// ---- Tile decode concurrency knob -------------------------------------------------
-		// 0     -> inline: decode on the main thread via async ImageDecoder (concurrent, but
-		//          subject to the browser's internal codec-thread pool). This is the baseline.
-		// N > 0  -> pool of N workers, each doing fetch + decode off-thread; main thread only
-		//          uploads. Try navigator.hardwareConcurrency - 1. Reload to apply (A/B the two).
-		// The GPU upload (copyExternalImageToTexture) always stays on the main thread since it
-		// owns the queue -- so if uploadMs dominates, the pool won't move total; the texture
-		// format / batching is the lever then, not more decode threads.
-		const TILE_DECODE_WORKERS = 0;
-		// -----------------------------------------------------------------------------------
-
 		let hotReload = false;
 		let webfileBuf = null; // bytes staged between webfile_fetch and webfile_copy
 		const webfileStash = {}; // id -> Uint8Array, staged between async fetch resolve and webfile_drain
 
-		// Cache ImageDecoder.isTypeSupported() per mime type (inline path). Resolves false when
-		// WebCodecs is unavailable or the type is unsupported -> createImageBitmap fallback.
+		// Cache ImageDecoder.isTypeSupported() per mime type: one probe, reused for every
+		// tile of that type. Resolves false when WebCodecs is unavailable or the type is
+		// unsupported, so tile_upload can fall back to createImageBitmap.
 		const decoderSupport = {};
 		function canDecode(type) {
 			if (!type || !("ImageDecoder" in window)) return Promise.resolve(false);
@@ -128,56 +70,6 @@
 				decoderSupport[type] = ImageDecoder.isTypeSupported(type).catch(() => false);
 			return decoderSupport[type];
 		}
-
-		// ---- Worker pool (used only when TILE_DECODE_WORKERS > 0) --------------------------
-		let tilePool = null;
-		const tilePending = new Map(); // id -> { texId, queueId, layer } awaiting a decoded frame
-
-		function initTilePool(n) {
-			const src = document.getElementById("tile-worker").textContent;
-			const blobUrl = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
-			tilePool = [];
-			for (let i = 0; i < n; i++) {
-				const w = new Worker(blobUrl);
-				w.inflight = 0;
-				w.onmessage = (e) => {
-					const m = e.data;
-					w.inflight--;
-					const p = tilePending.get(m.id); tilePending.delete(m.id);
-					if (!m.ok) {
-						console.error("tile worker", m.err);
-						wmi.exports.tile_uploaded(m.id, 0, 0, 0, 0, 0, ctxPtr);
-						return;
-					}
-					// Upload on the main thread (owns the queue). frame is a VideoFrame or an
-					// ImageBitmap; both are valid copyExternalImageToTexture sources.
-					const t2 = performance.now();
-					const tex = webgpu.textures.get(p.texId);
-					const queue = webgpu.queues.get(p.queueId);
-					const fw = m.frame.displayWidth ?? m.frame.width;
-					const fh = m.frame.displayHeight ?? m.frame.height;
-					queue.copyExternalImageToTexture(
-						{ source: m.frame },
-						{ texture: tex, origin: [0, 0, p.layer] },
-						[fw, fh, 1]);
-					m.frame.close();
-					const uploadMs = performance.now() - t2;
-					wmi.exports.tile_uploaded(m.id, 1, m.bytes, m.tFetch, m.decodeMs, uploadMs, ctxPtr);
-				};
-				tilePool.push(w);
-			}
-		}
-
-		// Least-busy dispatch. Keeps per-worker in-flight counts balanced so no core idles
-		// while another worker's queue backs up.
-		function dispatchTile(id, url, texId, queueId, layer) {
-			let best = tilePool[0];
-			for (const w of tilePool) if (w.inflight < best.inflight) best = w;
-			best.inflight++;
-			tilePending.set(id, { texId, queueId, layer });
-			best.postMessage({ id, url });
-		}
-		// -----------------------------------------------------------------------------------
 
 		const imports = {
 			...odin.setupDefaultImports(wmi, null, memory),
@@ -231,25 +123,21 @@
 				},
 			},
 			tiles: {
-				// Fetch a tile, decode it off the main thread, and copy it straight into the
+				// fetch a tile, decode it off the main thread, and copy it straight into the
 				// Odin-created texture array -- pixels never touch wasm. texId/queueId are
 				// wgpu.js object ids; resolve them via the object managers.
 				//
-				// Two modes (see TILE_DECODE_WORKERS): pool -> dispatch to a worker (fetch +
-				// decode off-thread, upload on return); inline -> ImageDecoder here, falling
-				// back to createImageBitmap. Fetching bytes then decoding keeps the frame
-				// origin-clean (no canvas taint), so cross-origin OSM/basemap tiles upload fine.
-				//
-				// NOTE: ImageDecoder yields a BGRA8 VideoFrame; if the destination texture array
-				// is RGBA8 the upload pays a swizzle. Match the texture format to bgra8unorm(-srgb)
-				// on the Odin side to hit the copyExternalImageToTexture memcpy fast path.
+				// Decode path: WebCodecs ImageDecoder -> VideoFrame when the browser can decode
+				// the tile's mime type (native dav1d for AVIF, no wasm), which moves the decode
+				// cost off the timed JS path and lets copyExternalImageToTexture take a VideoFrame
+				// directly. Falls back to createImageBitmap for unsupported types / no WebCodecs,
+				// preserving the origin-clean cross-origin upload for OSM/basemap tiles.
+				// NOTE: VideoFrame decodes to BGRA8; if the destination texture array is RGBA8,
+				// the upload pays a swizzle. Match the texture format to bgra8unorm(-srgb) on the
+				// Odin side to hit the memcpy fast path.
 				tile_upload: (id, urlPtr, urlLen, texId, queueId, layer) => {
 					const url = wmi.loadString(urlPtr, urlLen);
-
-					// Pool mode: hand off to a worker; upload happens in its onmessage.
-					if (tilePool) { dispatchTile(id, url, texId, queueId, layer); return; }
-
-					// Inline mode. Time each phase (ms) + byte size back to the Odin scheduler,
+					// Time each phase (ms) and report them + byte size back to the Odin scheduler,
 					// which aggregates the stats. Phases: fetch (network), decode, upload.
 					const t0 = performance.now();
 					let bytes = 0, tFetch = 0;
@@ -262,6 +150,8 @@
 							bytes = buf.byteLength;
 							const data = new Uint8Array(buf);
 
+							// Pick a mime type ImageDecoder understands: prefer the response
+							// header, else infer from the URL extension.
 							let type = (ct && ct.startsWith("image/")) ? ct.split(";")[0].trim() : "";
 							if (!type) {
 								if (/\.avif(\?|$)/i.test(url)) type = "image/avif";
@@ -296,6 +186,7 @@
 							const t2 = performance.now();
 							const tex = webgpu.textures.get(texId);
 							const queue = webgpu.queues.get(queueId);
+							// VideoFrame exposes displayWidth/Height; ImageBitmap exposes width/height.
 							const w = source.displayWidth ?? source.width;
 							const h = source.displayHeight ?? source.height;
 							queue.copyExternalImageToTexture(
@@ -389,7 +280,6 @@
 			stamp = m;
 		}, 500);
 
-		if (TILE_DECODE_WORKERS > 0) initTilePool(TILE_DECODE_WORKERS);
 		boot(false);
 	</script>
 </body>

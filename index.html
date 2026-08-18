@@ -18,7 +18,6 @@
 </head>
 <body>
 	<canvas id="canvas"></canvas>
-
 	<!-- source toggle: reloads with ?src=. avif + jpeg are local (fair); jpeg-cdn is basemap.at -->
 	<div id="ab">
 		<button data-src="avif">AVIF (github)</button>
@@ -38,7 +37,6 @@
 			}
 		})();
 	</script>
-
 	<!-- Odin js_wasm32 runtime: runWasm + WasmMemoryInterface (attached to window.odin) -->
 	<script src="odin.js"></script>
 	<!-- vendor:wgpu web backend: WebGPUInterface (browser WebGPU), also on window.odin -->
@@ -49,11 +47,9 @@
 				"<p style='color:#eee;font-family:sans-serif'>WebGPU is not available in this browser.</p>";
 			throw new Error("WebGPU not supported");
 		}
-
 		// Shared memory interface between the Odin runtime and the wgpu backend.
 		const wmi = new odin.WasmMemoryInterface();
 		const webgpu = new odin.WebGPUInterface(wmi);
-
 		// JS owns the linear memory (engine.wasm is built with --import-memory) and the
 		// wgpu interface, so both survive re-instantiation -> app state + GPU handles persist
 		// across a hot swap. Bump `initial` if instantiation throws a memory-minimum error.
@@ -61,12 +57,24 @@
 		wmi.setMemory(memory);
 
 		let hotReload = false;
-		let webfileBuf = null;   // bytes staged between webfile_fetch and webfile_copy
+		let webfileBuf = null; // bytes staged between webfile_fetch and webfile_copy
 		const webfileStash = {}; // id -> Uint8Array, staged between async fetch resolve and webfile_drain
+
+		// Cache ImageDecoder.isTypeSupported() per mime type: one probe, reused for every
+		// tile of that type. Resolves false when WebCodecs is unavailable or the type is
+		// unsupported, so tile_upload can fall back to createImageBitmap.
+		const decoderSupport = {};
+		function canDecode(type) {
+			if (!type || !("ImageDecoder" in window)) return Promise.resolve(false);
+			if (!(type in decoderSupport))
+				decoderSupport[type] = ImageDecoder.isTypeSupported(type).catch(() => false);
+			return decoderSupport[type];
+		}
+
 		const imports = {
 			...odin.setupDefaultImports(wmi, null, memory),
 			wgpu: webgpu.getInterface(),
-			hot: { is_reload: () => (hotReload ? 1 : 0) },   // read by Odin's foreign `is_reload`
+			hot: { is_reload: () => (hotReload ? 1 : 0) }, // read by Odin's foreign `is_reload`
 			webfile: {
 				// Synchronous XHR of a server-local path. Stashes bytes, returns length (-1 on error).
 				// Sync XHR forbids responseType="arraybuffer", so read binary via the
@@ -75,7 +83,7 @@
 					const path = wmi.loadString(ptr, len);
 					try {
 						const xhr = new XMLHttpRequest();
-						xhr.open("GET", path, false);                    // false = synchronous
+						xhr.open("GET", path, false); // false = synchronous
 						xhr.overrideMimeType("text/plain; charset=x-user-defined");
 						xhr.send();
 						if (xhr.status !== 200 && xhr.status !== 0) { webfileBuf = null; return -1; }
@@ -115,40 +123,77 @@
 				},
 			},
 			tiles: {
-				// fetch a tile, decode it off the main thread (createImageBitmap), and copy
-				// it straight into the Odin-created texture array -- pixels never touch wasm.
-				// texId/queueId are wgpu.js object ids; resolve them via the object managers.
-				// Fetching bytes then createImageBitmap keeps the bitmap origin-clean (no
-				// canvas taint), so cross-origin OSM tiles upload fine.
+				// fetch a tile, decode it off the main thread, and copy it straight into the
+				// Odin-created texture array -- pixels never touch wasm. texId/queueId are
+				// wgpu.js object ids; resolve them via the object managers.
+				//
+				// Decode path: WebCodecs ImageDecoder -> VideoFrame when the browser can decode
+				// the tile's mime type (native dav1d for AVIF, no wasm), which moves the decode
+				// cost off the timed JS path and lets copyExternalImageToTexture take a VideoFrame
+				// directly. Falls back to createImageBitmap for unsupported types / no WebCodecs,
+				// preserving the origin-clean cross-origin upload for OSM/basemap tiles.
+				// NOTE: VideoFrame decodes to BGRA8; if the destination texture array is RGBA8,
+				// the upload pays a swizzle. Match the texture format to bgra8unorm(-srgb) on the
+				// Odin side to hit the memcpy fast path.
 				tile_upload: (id, urlPtr, urlLen, texId, queueId, layer) => {
 					const url = wmi.loadString(urlPtr, urlLen);
 					// Time each phase (ms) and report them + byte size back to the Odin scheduler,
-					// which aggregates the stats. Phases: fetch (network), decode (createImageBitmap),
-					// upload (copyExternalImageToTexture).
+					// which aggregates the stats. Phases: fetch (network), decode, upload.
 					const t0 = performance.now();
 					let bytes = 0, tFetch = 0;
 					fetch(url, { cache: "no-store" })
-						.then(r => r.ok ? r.blob() : Promise.reject(r.status))
-						.then(blob => {
+						.then(r => r.ok
+							? r.arrayBuffer().then(buf => ({ buf, ct: r.headers.get("content-type") }))
+							: Promise.reject(r.status))
+						.then(async ({ buf, ct }) => {
 							tFetch = performance.now() - t0;
-							bytes = blob.size;
-							// colorSpaceConversion:"none" stops Chrome from applying ICC/color management
-							// on decode -- we want the raw sRGB tile bytes; the sRGB texture format
-							// handles the decode. (See Castano, "Image Loading on the Web".)
+							bytes = buf.byteLength;
+							const data = new Uint8Array(buf);
+
+							// Pick a mime type ImageDecoder understands: prefer the response
+							// header, else infer from the URL extension.
+							let type = (ct && ct.startsWith("image/")) ? ct.split(";")[0].trim() : "";
+							if (!type) {
+								if (/\.avif(\?|$)/i.test(url)) type = "image/avif";
+								else if (/\.jpe?g(\?|$)/i.test(url)) type = "image/jpeg";
+								else if (/\.png(\?|$)/i.test(url)) type = "image/png";
+								else if (/\.webp(\?|$)/i.test(url)) type = "image/webp";
+							}
+
 							const t1 = performance.now();
-							return createImageBitmap(blob, { colorSpaceConversion: "none", premultiplyAlpha: "none", imageOrientation: "none" })
-								.then(bmp => { bmp._decodeMs = performance.now() - t1; return bmp; });
-						})
-						.then(bmp => {
+							let source, decodeMs, cleanup;
+
+							if (await canDecode(type)) {
+								// Fast path: decode off-thread on the browser's codec threads.
+								const dec = new ImageDecoder({ data, type });
+								const { image: frame } = await dec.decode();
+								decodeMs = performance.now() - t1;
+								source = frame;
+								cleanup = () => { frame.close(); dec.close(); };
+							} else {
+								// Fallback: createImageBitmap from a Blob. colorSpaceConversion:"none"
+								// stops Chrome from applying ICC/color management on decode -- we want
+								// the raw sRGB tile bytes; the sRGB texture format handles the decode.
+								// (See Castano, "Image Loading on the Web".)
+								const blob = new Blob([data], { type: type || undefined });
+								const bmp = await createImageBitmap(blob,
+									{ colorSpaceConversion: "none", premultiplyAlpha: "none", imageOrientation: "none" });
+								decodeMs = performance.now() - t1;
+								source = bmp;
+								cleanup = () => bmp.close();
+							}
+
 							const t2 = performance.now();
 							const tex = webgpu.textures.get(texId);
 							const queue = webgpu.queues.get(queueId);
+							// VideoFrame exposes displayWidth/Height; ImageBitmap exposes width/height.
+							const w = source.displayWidth ?? source.width;
+							const h = source.displayHeight ?? source.height;
 							queue.copyExternalImageToTexture(
-								{ source: bmp },
+								{ source },
 								{ texture: tex, origin: [0, 0, layer] },
-								[bmp.width, bmp.height, 1]);
-							const decodeMs = bmp._decodeMs;
-							bmp.close();
+								[w, h, 1]);
+							cleanup();
 							const uploadMs = performance.now() - t2;
 							wmi.exports.tile_uploaded(id, 1, bytes, tFetch, decodeMs, uploadMs, ctxPtr);
 						})
@@ -189,22 +234,19 @@
 		async function boot(hot) {
 			hotReload = hot;
 			const bytes = await (await fetch("engine.wasm", { cache: "no-store" })).arrayBuffer();
-
 			// Serialize the persistent State out of the OLD instance before we throw it
 			// away. One blob, serialized by field name (survives layout changes) -- the gpu
 			// handles ride inside it now, same as the native host across a DLL swap.
 			let savedState = null;
 			if (hot) {
 				const e = wmi.exports;
-				const n = e.state_save(ctxPtr);                    // serialize State (gpu included) in the old instance
+				const n = e.state_save(ctxPtr); // serialize State (gpu included) in the old instance
 				savedState = wmi.loadU8Array(e.state_save_ptr(ctxPtr), n).slice();
 			}
-
 			const { instance } = await WebAssembly.instantiate(bytes, imports);
 			ctxPtr = instance.exports.default_context_ptr();
 			wmi.setExports(instance.exports);
-			instance.exports._start();                   // Odin init + main -> run() (bails early if hot)
-
+			instance.exports._start(); // Odin init + main -> run() (bails early if hot)
 			// Steps below run synchronously after _start (no await), so no RAF frame sees a
 			// half-restored persist.
 			if (hot) {
@@ -221,7 +263,7 @@
 
 		// dev livereload: swap the module in place when engine.wasm changes (served by serve.py).
 		// ponytail: harmless in prod -- a HEAD every 500ms that never triggers a swap. Strip if it bugs you.
-		const WASM_HOT_RELOAD = false;   // toggle dev livereload
+		const WASM_HOT_RELOAD = false; // toggle dev livereload
 		let stamp;
 		if (WASM_HOT_RELOAD) setInterval(async () => {
 			const m = (await fetch("engine.wasm", { method: "HEAD", cache: "no-store" }))

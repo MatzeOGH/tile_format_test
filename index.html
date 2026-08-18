@@ -112,7 +112,7 @@
 		// The GPU upload (copyExternalImageToTexture) always stays on the main thread since it
 		// owns the queue -- so if uploadMs dominates, the pool won't move total; the texture
 		// format / batching is the lever then, not more decode threads.
-		const TILE_DECODE_WORKERS = 0;
+		const TILE_DECODE_WORKERS = 4;
 		// -----------------------------------------------------------------------------------
 
 		let hotReload = false;

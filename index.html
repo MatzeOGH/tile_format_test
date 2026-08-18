@@ -1,0 +1,238 @@
+<!doctype html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Engine Renderer</title>
+	<style>
+		html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
+		canvas { display: block; width: 100vw; height: 100vh; }
+		#ab { position: fixed; top: 10px; right: 10px; display: flex; gap: 6px; font-family: sans-serif; }
+		#ab button { padding: 6px 12px; border: 1px solid #555; background: #222; color: #ccc;
+			cursor: pointer; border-radius: 4px; font-size: 13px; }
+		#ab button.active { background: #2a7; color: #000; border-color: #2a7; font-weight: bold; }
+		#stats { position: fixed; top: 10px; left: 10px; margin: 0; padding: 10px 14px;
+			background: rgba(0,0,0,0.72); color: #cfe; font: 12px/1.55 ui-monospace, monospace;
+			border-radius: 6px; white-space: pre; }
+		#stats[hidden] { display: none; }
+	</style>
+</head>
+<body>
+	<canvas id="canvas"></canvas>
+
+	<!-- A/B source toggle: reloads with ?src=avif|jpeg -->
+	<div id="ab">
+		<button data-src="avif">AVIF</button>
+		<button data-src="jpeg">JPEG</button>
+	</div>
+	<!-- tile stats panel, revealed by the Odin scheduler once the block finishes loading -->
+	<pre id="stats" hidden></pre>
+	<script>
+		// mark the active source and wire the buttons to reload with the query param
+		(() => {
+			const cur = new URLSearchParams(location.search).get("src") === "jpeg" ? "jpeg" : "avif";
+			for (const b of document.querySelectorAll("#ab button")) {
+				if (b.dataset.src === cur) b.classList.add("active");
+				b.onclick = () => { location.search = "?src=" + b.dataset.src; };
+			}
+		})();
+	</script>
+
+	<!-- Odin js_wasm32 runtime: runWasm + WasmMemoryInterface (attached to window.odin) -->
+	<script src="odin.js"></script>
+	<!-- vendor:wgpu web backend: WebGPUInterface (browser WebGPU), also on window.odin -->
+	<script src="wgpu.js"></script>
+	<script>
+		if (!navigator.gpu) {
+			document.body.innerHTML =
+				"<p style='color:#eee;font-family:sans-serif'>WebGPU is not available in this browser.</p>";
+			throw new Error("WebGPU not supported");
+		}
+
+		// Shared memory interface between the Odin runtime and the wgpu backend.
+		const wmi = new odin.WasmMemoryInterface();
+		const webgpu = new odin.WebGPUInterface(wmi);
+
+		// JS owns the linear memory (engine.wasm is built with --import-memory) and the
+		// wgpu interface, so both survive re-instantiation -> app state + GPU handles persist
+		// across a hot swap. Bump `initial` if instantiation throws a memory-minimum error.
+		const memory = new WebAssembly.Memory({ initial: 1024, maximum: 16384 });
+		wmi.setMemory(memory);
+
+		let hotReload = false;
+		let webfileBuf = null;   // bytes staged between webfile_fetch and webfile_copy
+		const webfileStash = {}; // id -> Uint8Array, staged between async fetch resolve and webfile_drain
+		const imports = {
+			...odin.setupDefaultImports(wmi, null, memory),
+			wgpu: webgpu.getInterface(),
+			hot: { is_reload: () => (hotReload ? 1 : 0) },   // read by Odin's foreign `is_reload`
+			webfile: {
+				// Synchronous XHR of a server-local path. Stashes bytes, returns length (-1 on error).
+				// Sync XHR forbids responseType="arraybuffer", so read binary via the
+				// x-user-defined charset trick and mask each char back to a byte.
+				webfile_fetch: (ptr, len) => {
+					const path = wmi.loadString(ptr, len);
+					try {
+						const xhr = new XMLHttpRequest();
+						xhr.open("GET", path, false);                    // false = synchronous
+						xhr.overrideMimeType("text/plain; charset=x-user-defined");
+						xhr.send();
+						if (xhr.status !== 200 && xhr.status !== 0) { webfileBuf = null; return -1; }
+						const s = xhr.responseText;
+						const b = new Uint8Array(s.length);
+						for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xff;
+						webfileBuf = b;
+						return b.length;
+					} catch (e) { console.error("webfile_fetch", path, e); webfileBuf = null; return -1; }
+				},
+				// buf: []byte arrives as (ptr, len) -- fill it from the stash, then clear.
+				webfile_copy: (ptr, len) => {
+					wmi.loadU8Array(ptr, len).set(webfileBuf);
+					webfileBuf = null;
+				},
+				// Async fetch; on settle, stash bytes by id and call the wasm trampoline
+				// (JS appends ctxPtr, like step). wmi.exports/ctxPtr are read live, so after
+				// a hot swap this hits the new instance -- which drops unknown ids.
+				webfile_request: (id, ptr, len) => {
+					const path = wmi.loadString(ptr, len);
+					fetch(path, { cache: "no-store" })
+						.then(r => r.ok ? r.arrayBuffer() : Promise.reject(r.status))
+						.then(buf => {
+							const b = new Uint8Array(buf);
+							webfileStash[id] = b;
+							wmi.exports.webfile_deliver(id, b.length, 1, ctxPtr);
+							delete webfileStash[id];
+						})
+						.catch(e => {
+							console.error("webfile_request", path, e);
+							wmi.exports.webfile_deliver(id, 0, 0, ctxPtr);
+						});
+				},
+				// Copy the stashed async bytes for `id` into buf (called during deliver).
+				webfile_drain: (id, ptr, len) => {
+					wmi.loadU8Array(ptr, len).set(webfileStash[id]);
+				},
+			},
+			tiles: {
+				// fetch a tile, decode it off the main thread (createImageBitmap), and copy
+				// it straight into the Odin-created texture array -- pixels never touch wasm.
+				// texId/queueId are wgpu.js object ids; resolve them via the object managers.
+				// Fetching bytes then createImageBitmap keeps the bitmap origin-clean (no
+				// canvas taint), so cross-origin OSM tiles upload fine.
+				tile_upload: (id, urlPtr, urlLen, texId, queueId, layer) => {
+					const url = wmi.loadString(urlPtr, urlLen);
+					// Time each phase (ms) and report them + byte size back to the Odin scheduler,
+					// which aggregates the stats. Phases: fetch (network), decode (createImageBitmap),
+					// upload (copyExternalImageToTexture).
+					const t0 = performance.now();
+					let bytes = 0, tFetch = 0;
+					fetch(url, { cache: "no-store" })
+						.then(r => r.ok ? r.blob() : Promise.reject(r.status))
+						.then(blob => {
+							tFetch = performance.now() - t0;
+							bytes = blob.size;
+							// colorSpaceConversion:"none" stops Chrome from applying ICC/color management
+							// on decode -- we want the raw sRGB tile bytes; the sRGB texture format
+							// handles the decode. (See Castano, "Image Loading on the Web".)
+							const t1 = performance.now();
+							return createImageBitmap(blob, { colorSpaceConversion: "none", premultiplyAlpha: "none", imageOrientation: "none" })
+								.then(bmp => { bmp._decodeMs = performance.now() - t1; return bmp; });
+						})
+						.then(bmp => {
+							const t2 = performance.now();
+							const tex = webgpu.textures.get(texId);
+							const queue = webgpu.queues.get(queueId);
+							queue.copyExternalImageToTexture(
+								{ source: bmp },
+								{ texture: tex, origin: [0, 0, layer] },
+								[bmp.width, bmp.height, 1]);
+							const decodeMs = bmp._decodeMs;
+							bmp.close();
+							const uploadMs = performance.now() - t2;
+							wmi.exports.tile_uploaded(id, 1, bytes, tFetch, decodeMs, uploadMs, ctxPtr);
+						})
+						.catch(e => {
+							console.error("tile_upload", url, e);
+							wmi.exports.tile_uploaded(id, 0, 0, 0, 0, 0, ctxPtr);
+						});
+				},
+				// A/B source flag from the page URL: ?src=jpeg -> live basemap.at JPEG; default -> local AVIF.
+				tile_use_avif: () => (new URLSearchParams(location.search).get("src") === "jpeg" ? 0 : 1),
+				// The Odin scheduler calls this with the formatted stats block once the tile block
+				// finishes loading; reveal the on-page panel.
+				tiles_stats: (ptr, len) => {
+					const el = document.getElementById("stats");
+					el.textContent = wmi.loadString(ptr, len);
+					el.hidden = false;
+				},
+				// Monotonic clock (ms) for the scheduler's wall-clock total.
+				tiles_now: () => performance.now(),
+			},
+		};
+
+		// One persistent RAF loop across all module swaps; it always calls the *current*
+		// instance via wmi.exports. odin.js's env callbacks read wmi.exports live too, so
+		// setExports() repoints every host callback at the new instance.
+		let ctxPtr = 0, rafId = 0, prev;
+		function loop(t) {
+			if (prev === undefined) prev = t;
+			const dt = (t - prev) * 0.001; prev = t;
+			wmi.exports.step(dt, ctxPtr);
+			rafId = requestAnimationFrame(loop);
+		}
+
+		async function boot(hot) {
+			hotReload = hot;
+			const bytes = await (await fetch("engine.wasm", { cache: "no-store" })).arrayBuffer();
+
+			// Serialize the persistent State out of the OLD instance before we throw it
+			// away. One blob, serialized by field name (survives layout changes) -- the gpu
+			// handles ride inside it now, same as the native host across a DLL swap.
+			let savedState = null;
+			if (hot) {
+				const e = wmi.exports;
+				const n = e.state_save(ctxPtr);                    // serialize State (gpu included) in the old instance
+				savedState = wmi.loadU8Array(e.state_save_ptr(ctxPtr), n).slice();
+			}
+
+			const { instance } = await WebAssembly.instantiate(bytes, imports);
+			ctxPtr = instance.exports.default_context_ptr();
+			wmi.setExports(instance.exports);
+			instance.exports._start();                   // Odin init + main -> run() (bails early if hot)
+
+			// Steps below run synchronously after _start (no await), so no RAF frame sees a
+			// half-restored persist.
+			if (hot) {
+				const e = instance.exports;
+				// State (gpu handles included) is remapped by field name, so a layout change
+				// needs no guard -- new fields default, the opaque wgpu ids copy through.
+				const buf = e.state_load_buf(savedState.length, ctxPtr);
+				wmi.loadU8Array(buf, savedState.length).set(savedState);
+				e.state_load(ctxPtr);
+				e.hot_resume(ctxPtr);
+			}
+			if (!rafId) rafId = requestAnimationFrame(loop);
+		}
+
+		// dev livereload: swap the module in place when engine.wasm changes (served by serve.py).
+		// ponytail: harmless in prod -- a HEAD every 500ms that never triggers a swap. Strip if it bugs you.
+		const WASM_HOT_RELOAD = false;   // toggle dev livereload
+		let stamp;
+		if (WASM_HOT_RELOAD) setInterval(async () => {
+			const m = (await fetch("engine.wasm", { method: "HEAD", cache: "no-store" }))
+				.headers.get("Last-Modified");
+			if (stamp && m !== stamp) {
+				// Drop stale window listeners (they hold the old instance's callback indices);
+				// the new run()/hot_resume re-adds them against the fresh instance.
+				for (const [k, l] of wmi.listenerMap) {
+					window.removeEventListener(k.split("-data:")[0].split("-").slice(1).join("-"), l);
+				}
+				wmi.listenerMap.clear();
+				try { await boot(true); } catch (e) { console.error(e); location.reload(); }
+			}
+			stamp = m;
+		}, 500);
+
+		boot(false);
+	</script>
+</body>
+</html>

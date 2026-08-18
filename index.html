@@ -19,17 +19,19 @@
 <body>
 	<canvas id="canvas"></canvas>
 
-	<!-- A/B source toggle: reloads with ?src=avif|jpeg -->
+	<!-- source toggle: reloads with ?src=. avif + jpeg are local (fair); jpeg-cdn is basemap.at -->
 	<div id="ab">
-		<button data-src="avif">AVIF</button>
-		<button data-src="jpeg">JPEG</button>
+		<button data-src="avif">AVIF (github)</button>
+		<button data-src="jpeg">JPEG (github)</button>
+		<button data-src="jpeg-cdn">JPEG (TU)</button>
 	</div>
 	<!-- tile stats panel, revealed by the Odin scheduler once the block finishes loading -->
 	<pre id="stats" hidden></pre>
 	<script>
 		// mark the active source and wire the buttons to reload with the query param
 		(() => {
-			const cur = new URLSearchParams(location.search).get("src") === "jpeg" ? "jpeg" : "avif";
+			const raw = new URLSearchParams(location.search).get("src");
+			const cur = (raw === "jpeg" || raw === "jpeg-cdn") ? raw : "avif";
 			for (const b of document.querySelectorAll("#ab button")) {
 				if (b.dataset.src === cur) b.classList.add("active");
 				b.onclick = () => { location.search = "?src=" + b.dataset.src; };
@@ -155,8 +157,12 @@
 							wmi.exports.tile_uploaded(id, 0, 0, 0, 0, 0, ctxPtr);
 						});
 				},
-				// A/B source flag from the page URL: ?src=jpeg -> live basemap.at JPEG; default -> local AVIF.
-				tile_use_avif: () => (new URLSearchParams(location.search).get("src") === "jpeg" ? 0 : 1),
+				// Source select from ?src=: jpeg -> 1 (local JPEG, fair), jpeg-cdn -> 2 (basemap.at),
+				// anything else -> 0 (local AVIF, default).
+				tile_source: () => {
+					const s = new URLSearchParams(location.search).get("src");
+					return s === "jpeg" ? 1 : (s === "jpeg-cdn" ? 2 : 0);
+				},
 				// The Odin scheduler calls this with the formatted stats block once the tile block
 				// finishes loading; reveal the on-page panel.
 				tiles_stats: (ptr, len) => {

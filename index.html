@@ -2,7 +2,7 @@
 <html>
 <head>
 	<meta charset="utf-8">
-	<title>Engine Renderer</title>
+	<title>tile format test</title>
 	<style>
 		html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
 		canvas { display: block; width: 100vw; height: 100vh; }
@@ -23,18 +23,30 @@
 		<button data-src="avif">AVIF (github)</button>
 		<button data-src="jpeg">JPEG (github)</button>
 		<button data-src="jpeg-cdn">JPEG (TU)</button>
+		<button id="cacheBtn">Cache: OFF</button>
 	</div>
 	<!-- tile stats panel, revealed by the Odin scheduler once the block finishes loading -->
 	<pre id="stats" hidden></pre>
 	<script>
-		// mark the active source and wire the buttons to reload with the query param
+		// mark the active source and wire the buttons to reload with the query param.
+		// the &cached flag is carried across reloads so switching source keeps cache mode.
 		(() => {
-			const raw = new URLSearchParams(location.search).get("src");
+			const params = new URLSearchParams(location.search);
+			const raw = params.get("src");
 			const cur = (raw === "jpeg" || raw === "jpeg-cdn") ? raw : "avif";
-			for (const b of document.querySelectorAll("#ab button")) {
+			const cached = params.has("cached");
+			// build the search string for a source, preserving the cached flag
+			const search = (src, isCached) => "?src=" + src + (isCached ? "&cached" : "");
+
+			for (const b of document.querySelectorAll("#ab button[data-src]")) {
 				if (b.dataset.src === cur) b.classList.add("active");
-				b.onclick = () => { location.search = "?src=" + b.dataset.src; };
+				b.onclick = () => { location.search = search(b.dataset.src, cached); };
 			}
+			// cache toggle: reload with/without &cached, keeping the current source
+			const cb = document.getElementById("cacheBtn");
+			if (cached) cb.classList.add("active");
+			cb.textContent = cached ? "Cache: ON" : "Cache: OFF";
+			cb.onclick = () => { location.search = search(cur, !cached); };
 		})();
 	</script>
 	<!-- Odin js_wasm32 runtime: runWasm + WasmMemoryInterface (attached to window.odin) -->
@@ -64,6 +76,13 @@
 		// tiles complete. Fed to the scheduler through tiles_now() so its "total" line reports
 		// summed work (sum of fetch + sum of decode) rather than wall-clock elapsed. Reset per (re)boot.
 		let tilesTotal = 0;
+
+		// ?cached (or &cached) switches tile fetches from no-store to the browser HTTP cache.
+		// First load with the flag warms the cache (network); reload with it to measure the
+		// cache-hit path. Only the fetch phase changes -- decode/upload cost stays the same --
+		// so the stats panel's fetch time is the number that should drop. no-store elsewhere
+		// (wasm, webfiles) is left alone on purpose.
+		const TILES_CACHED = new URLSearchParams(location.search).has("cached");
 
 		// Cache ImageDecoder.isTypeSupported() per mime type: one probe, reused for every
 		// tile of that type. Resolves false when WebCodecs is unavailable or the type is
@@ -146,7 +165,9 @@
 					// which aggregates the stats. Phases: fetch (network), decode, upload.
 					const t0 = performance.now();
 					let bytes = 0, tFetch = 0;
-					fetch(url, { cache: "no-store" })
+					// no-store by default; ?cached -> force-cache so a warmed reload is served
+					// from the browser HTTP cache and the fetch phase collapses.
+					fetch(url, { cache: TILES_CACHED ? "force-cache" : "no-store" })
 						.then(r => r.ok
 							? r.arrayBuffer().then(buf => ({ buf, ct: r.headers.get("content-type") }))
 							: Promise.reject(r.status))

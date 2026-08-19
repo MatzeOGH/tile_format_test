@@ -171,8 +171,11 @@
 							if (await canDecode(type)) {
 								// Fast path: decode off-thread on the browser's codec threads.
 								console.log("Decode Fast path");
+								performance.mark("decode-start");
 								const dec = new ImageDecoder({ data, type });
 								const { image: frame } = await dec.decode();
+								performance.mark("decode-end");
+								performance.measure("image-decode", "decode-start", "decode-end");
 								decodeMs = performance.now() - t1;
 								source = frame;
 								cleanup = () => { frame.close(); dec.close(); };

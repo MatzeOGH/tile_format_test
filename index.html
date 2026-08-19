@@ -2,7 +2,7 @@
 <html>
 <head>
 	<meta charset="utf-8">
-	<title>Tile format test</title>
+	<title>Engine Renderer</title>
 	<style>
 		html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
 		canvas { display: block; width: 100vw; height: 100vh; }
@@ -59,6 +59,11 @@
 		let hotReload = false;
 		let webfileBuf = null; // bytes staged between webfile_fetch and webfile_copy
 		const webfileStash = {}; // id -> Uint8Array, staged between async fetch resolve and webfile_drain
+
+		// Summed tile work (ms): running sum of each tile's fetch + decode time, accumulated as
+		// tiles complete. Fed to the scheduler through tiles_now() so its "total" line reports
+		// summed work (sum of fetch + sum of decode) rather than wall-clock elapsed. Reset per (re)boot.
+		let tilesTotal = 0;
 
 		// Cache ImageDecoder.isTypeSupported() per mime type: one probe, reused for every
 		// tile of that type. Resolves false when WebCodecs is unavailable or the type is
@@ -193,8 +198,9 @@
 								{ texture: tex, origin: [0, 0, layer] },
 								[w, h, 1]);
 							cleanup();
-							// Upload time is not tracked -- report 0 so the scheduler's total is
-							// fetch + decode only.
+							// Upload time is not tracked -- report 0. Add this tile's fetch + decode
+							// to the running total the scheduler reads via tiles_now().
+							tilesTotal += tFetch + decodeMs;
 							wmi.exports.tile_uploaded(id, 1, bytes, tFetch, decodeMs, 0, ctxPtr);
 						})
 						.catch(e => {
@@ -215,8 +221,12 @@
 					el.textContent = wmi.loadString(ptr, len);
 					el.hidden = false;
 				},
-				// Monotonic clock (ms) for the scheduler's wall-clock total.
-				tiles_now: () => performance.now(),
+				// The scheduler builds its "total" as tiles_now(end) - tiles_now(start). Return the
+				// running summed work instead of a real clock: it reads 0 before any tile finishes
+				// and (sum of fetch + sum of decode) once they all have, so the total becomes summed
+				// work. NOTE: the panel still labels that line "wall" -- fix the label in the Odin
+				// formatter if it matters.
+				tiles_now: () => tilesTotal,
 			},
 		};
 
@@ -233,6 +243,7 @@
 
 		async function boot(hot) {
 			hotReload = hot;
+			tilesTotal = 0; // reset the summed-work total for this (re)boot
 			const bytes = await (await fetch("engine.wasm", { cache: "no-store" })).arrayBuffer();
 			// Serialize the persistent State out of the OLD instance before we throw it
 			// away. One blob, serialized by field name (survives layout changes) -- the gpu

@@ -2,7 +2,7 @@
 <html>
 <head>
 	<meta charset="utf-8">
-	<title>tile format test</title>
+	<title>tile format test</title></title>
 	<style>
 		html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
 		canvas { display: block; width: 100vw; height: 100vh; }
@@ -10,10 +10,12 @@
 		#ab button { padding: 6px 12px; border: 1px solid #555; background: #222; color: #ccc;
 			cursor: pointer; border-radius: 4px; font-size: 13px; }
 		#ab button.active { background: #2a7; color: #000; border-color: #2a7; font-weight: bold; }
-		#stats { position: fixed; top: 10px; left: 10px; margin: 0; padding: 10px 14px;
+		#stats, #metrics { position: fixed; margin: 0; padding: 10px 14px;
 			background: rgba(0,0,0,0.72); color: #cfe; font: 12px/1.55 ui-monospace, monospace;
 			border-radius: 6px; white-space: pre; }
-		#stats[hidden] { display: none; }
+		#stats { top: 10px; left: 10px; }
+		#metrics { bottom: 10px; left: 10px; }
+		#stats[hidden], #metrics[hidden] { display: none; }
 	</style>
 </head>
 <body>
@@ -27,6 +29,8 @@
 	</div>
 	<!-- tile stats panel, revealed by the Odin scheduler once the block finishes loading -->
 	<pre id="stats" hidden></pre>
+	<!-- JS-side fetch/decode totals + averages, computed in tile_upload as tiles complete -->
+	<pre id="metrics" hidden></pre>
 	<script>
 		// mark the active source and wire the buttons to reload with the query param.
 		// the &cached flag is carried across reloads so switching source keeps cache mode.
@@ -76,6 +80,22 @@
 		// tiles complete. Fed to the scheduler through tiles_now() so its "total" line reports
 		// summed work (sum of fetch + sum of decode) rather than wall-clock elapsed. Reset per (re)boot.
 		let tilesTotal = 0;
+
+		// Per-run accumulators for the #metrics panel. Totals are summed work (each tile's
+		// duration added up) -- with tiles fetching/decoding concurrently the sums exceed
+		// wall-clock elapsed, so read the averages as the per-tile cost. Reset each (re)boot.
+		let fetchTotal = 0, decodeTotal = 0, tileCount = 0;
+		function renderTileMetrics() {
+			const el = document.getElementById("metrics");
+			if (!el || !tileCount) return;
+			const favg = (fetchTotal / tileCount).toFixed(2);
+			const davg = (decodeTotal / tileCount).toFixed(2);
+			el.textContent =
+				`tiles   ${tileCount}\n` +
+				`fetch   total ${fetchTotal.toFixed(1)} ms   avg ${favg} ms\n` +
+				`decode  total ${decodeTotal.toFixed(1)} ms   avg ${davg} ms`;
+			el.hidden = false;
+		}
 
 		// ?cached (or &cached) switches tile fetches from no-store to the browser HTTP cache.
 		// First load with the flag warms the cache (network); reload with it to measure the
@@ -226,6 +246,8 @@
 							// Upload time is not tracked -- report 0. Add this tile's fetch + decode
 							// to the running total the scheduler reads via tiles_now().
 							tilesTotal += tFetch + decodeMs;
+							fetchTotal += tFetch; decodeTotal += decodeMs; tileCount++;
+							renderTileMetrics();
 							wmi.exports.tile_uploaded(id, 1, bytes, tFetch, decodeMs, 0, ctxPtr);
 						})
 						.catch(e => {
@@ -269,6 +291,8 @@
 		async function boot(hot) {
 			hotReload = hot;
 			tilesTotal = 0; // reset the summed-work total for this (re)boot
+			fetchTotal = 0; decodeTotal = 0; tileCount = 0; // reset the metrics-panel accumulators
+			{ const m = document.getElementById("metrics"); if (m) m.hidden = true; }
 			const bytes = await (await fetch("engine.wasm", { cache: "no-store" })).arrayBuffer();
 			// Serialize the persistent State out of the OLD instance before we throw it
 			// away. One blob, serialized by field name (survives layout changes) -- the gpu

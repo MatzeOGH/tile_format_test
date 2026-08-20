@@ -411,11 +411,7 @@ class WebGPUInterface {
 			return undefined;
 		}
 
-		// Local patch: DeviceDescriptor.requiredLimits is `^Limits` (flattened webgpu.h),
-		// pointing directly at a Limits — not the old RequiredLimits wrapper. The stock
-		// `start + 8` skipped into the fields, producing garbage limits that made
-		// requestDevice reject. Limits() already skips its own nextInChain.
-		return this.Limits(start);
+		return this.Limits(start + 8);
 	}
 
 	/**

@@ -6,41 +6,124 @@
 	<style>
 		html, body { margin: 0; height: 100%; background: #111; overflow: hidden; }
 		canvas { display: block; width: 100vw; height: 100vh; }
-		#ab { position: fixed; top: 10px; right: 10px; display: flex; gap: 6px; font-family: sans-serif; }
-		#ab button { padding: 6px 12px; border: 1px solid #555; background: #222; color: #ccc;
-			cursor: pointer; border-radius: 4px; font-size: 13px; }
+		#ab { position: fixed; top: 10px; right: 10px; display: flex; flex-direction: column;
+			align-items: stretch; gap: 3px; max-height: 96vh; overflow-y: auto; font-family: sans-serif; }
+		#ab button { padding: 4px 10px; border: 1px solid #555; background: #222; color: #ccc;
+			cursor: pointer; border-radius: 4px; font-size: 12px; text-align: left; }
 		#ab button.active { background: #2a7; color: #000; border-color: #2a7; font-weight: bold; }
+		#ab .sep { height: 1px; width: auto; background: #444; margin: 3px 0; }
 		#stats, #metrics { position: fixed; margin: 0; padding: 10px 14px;
 			background: rgba(0,0,0,0.72); color: #cfe; font: 12px/1.55 ui-monospace, monospace;
 			border-radius: 6px; white-space: pre; }
 		#stats { top: 10px; left: 10px; }
 		#metrics { bottom: 10px; left: 10px; }
 		#stats[hidden], #metrics[hidden] { display: none; }
+		/* load-stats comparison widget: persisted per-format stats across reloads (localStorage) */
+		#compare { position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+			max-width: 90vw; max-height: 80vh; overflow: auto; z-index: 10;
+			padding: 14px 16px; background: rgba(0,0,0,0.9); color: #cfe;
+			border: 1px solid #444; border-radius: 8px;
+			font: 12px/1.5 ui-monospace, monospace; }
+		#compare[hidden] { display: none; }
+		#compare .head { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+		#compare .head b { color: #fff; font-size: 13px; }
+		#compare .head .grow { flex: 1; }
+		#compare .head button { padding: 3px 10px; border: 1px solid #555; background: #222;
+			color: #ccc; cursor: pointer; border-radius: 4px; font: inherit; }
+		#compare table { border-collapse: collapse; }
+		#compare th, #compare td { padding: 4px 10px; text-align: right; white-space: nowrap; }
+		#compare th { color: #9ab; border-bottom: 1px solid #444; font-weight: normal; }
+		#compare td.fmt, #compare th.fmt { text-align: left; color: #cde; }
+		#compare tr.cat td { color: #7bd; padding-top: 10px; text-align: left;
+			font-weight: bold; letter-spacing: .04em; }
+		#compare tr.cur td.fmt { color: #2fa; font-weight: bold; }
+		#compare td .mm { display: block; color: #789; font-size: 10px; }
+		#compare td.best .v { color: #4f8; font-weight: bold; }
+		#compare .empty { color: #9ab; padding: 6px 2px; }
 	</style>
 </head>
 <body>
 	<canvas id="canvas"></canvas>
-	<!-- source toggle: reloads with ?src=. avif + jpeg are local (fair); jpeg-cdn is basemap.at -->
+	<!-- format toggle: reloads with ?src=<key>. Every button loads the SAME 4x4 tile block in one
+	     encoding; the stats panel reports its fetch/decode/upload for load-speed + quality compare.
+	     data-src values ARE the keys in `formats` (tiles.odin) / TILE_FORMATS (below). -->
 	<div id="ab">
-		<button data-src="avif">AVIF (github)</button>
-		<button data-src="jpeg">JPEG (github)</button>
-		<button data-src="jpeg-cdn">JPEG (TU)</button>
+		<button data-src="avif" title="browser AVIF baseline">AVIF</button>
+		<button data-src="jpeg" title="browser JPEG baseline">JPEG</button>
+		<button data-src="jpeg-cdn" title="live basemap.at JPEG (CDN)">JPEG CDN</button>
+		<span class="sep"></span>
+		<button data-src="etc1s" title="KTX2 BasisLZ/ETC1S">ETC1S</button>
+		<button data-src="etc1s_q192" title="ETC1S quality 192">ETC1S q192</button>
+		<button data-src="etc1s_q255" title="ETC1S quality 255">ETC1S q255</button>
+		<button data-src="uastc4x4" title="UASTC LDR 4x4">UASTC</button>
+		<button data-src="uastc4x4_rdo" title="UASTC 4x4 + RDO">UASTC rdo</button>
+		<span class="sep"></span>
+		<button data-src="xuastc4x4" title="XUASTC 4x4">XUASTC 4×4</button>
+		<button data-src="xuastc5x5" title="XUASTC 5x5">XUASTC 5×5</button>
+		<button data-src="xuastc6x6" title="XUASTC 6x6">XUASTC 6×6</button>
+		<button data-src="xuastc6x6_q75" title="XUASTC 6x6 q75">XUASTC 6×6 q75</button>
+		<button data-src="xuastc8x8" title="XUASTC 8x8">XUASTC 8×8</button>
+		<button data-src="xuastc8x8_q75" title="XUASTC 8x8 q75">XUASTC 8×8 q75</button>
+		<button data-src="xuastc10x10" title="XUASTC 10x10">XUASTC 10×10</button>
+		<button data-src="xuastc12x12" title="XUASTC 12x12">XUASTC 12×12</button>
+		<span class="sep"></span>
+		<button data-src="xubc7" title="XUASTC -> BC7">XUBC7</button>
+		<button data-src="xubc7_q40" title="XUBC7 q40">XUBC7 q40</button>
+		<button data-src="xubc7_q75" title="XUBC7 q75">XUBC7 q75</button>
+		<span class="sep"></span>
+		<button id="compareBtn" title="Compare saved load stats across reloads">Compare</button>
+		<span class="sep"></span>
 		<button id="cacheBtn">Cache: OFF</button>
+		<!-- view: snap to exact 1:1 pixel-to-texel (artefact inspection), or re-fit -->
+		<button id="oneToOneBtn" title="1 texel = 1 device pixel (key 1)">1:1</button>
+		<button id="fitBtn" title="Fit the whole block (key 0)">Fit</button>
 	</div>
 	<!-- tile stats panel, revealed by the Odin scheduler once the block finishes loading -->
 	<pre id="stats" hidden></pre>
 	<!-- JS-side fetch/decode totals + averages, computed in tile_upload as tiles complete -->
 	<pre id="metrics" hidden></pre>
+		<!-- load-stats comparison: reads the localStorage history written by recordTileStats,
+		     grouped by category and format. Toggled by #compareBtn. -->
+		<div id="compare" hidden>
+			<div class="head">
+				<b>Load-stats comparison</b>
+				<span id="compareSummary"></span>
+				<span class="grow"></span>
+				<button id="compareClear" title="Delete all saved runs">Clear</button>
+				<button id="compareClose" title="Close">✕</button>
+			</div>
+			<div id="compareBody"></div>
+		</div>
 	<script>
+		// The tile formats, in the SAME order as `formats` in tiles.odin -- index = what
+		// tile_format() returns. Each value is a ?src= key and a #ab button's data-src. Keep the
+		// two lists in lockstep when adding an encoding.
+		const TILE_FORMATS = [
+			"avif", "jpeg", "jpeg-cdn",
+			"etc1s", "etc1s_q192", "etc1s_q255",
+			"uastc4x4", "uastc4x4_rdo",
+			"xuastc4x4", "xuastc5x5", "xuastc6x6", "xuastc6x6_q75",
+			"xuastc8x8", "xuastc8x8_q75", "xuastc10x10", "xuastc12x12",
+			"xubc7", "xubc7_q40", "xubc7_q75",
+		];
+
 		// mark the active source and wire the buttons to reload with the query param.
 		// the &cached flag is carried across reloads so switching source keeps cache mode.
 		(() => {
 			const params = new URLSearchParams(location.search);
 			const raw = params.get("src");
-			const cur = (raw === "jpeg" || raw === "jpeg-cdn") ? raw : "avif";
+			// avif (index 0) is the default; any other known format highlights its own button.
+			const cur = TILE_FORMATS.includes(raw) ? raw : "avif";
 			const cached = params.has("cached");
-			// build the search string for a source, preserving the cached flag
-			const search = (src, isCached) => "?src=" + src + (isCached ? "&cached" : "");
+			// Build the search string for a source, preserving the cached flag and the CURRENT
+			// view. flushView() (defined in the wasm script) commits any pending debounced zoom
+			// to the URL first, then we read `view` live -- capturing it at load would carry a
+			// stale zoom across the switch.
+			const search = (src, isCached) => {
+				flushView();
+				const view = new URLSearchParams(location.search).get("view");
+				return "?src=" + src + (isCached ? "&cached" : "") + (view ? "&view=" + encodeURIComponent(view) : "");
+			};
 
 			for (const b of document.querySelectorAll("#ab button[data-src]")) {
 				if (b.dataset.src === cur) b.classList.add("active");
@@ -51,6 +134,147 @@
 			if (cached) cb.classList.add("active");
 			cb.textContent = cached ? "Cache: ON" : "Cache: OFF";
 			cb.onclick = () => { location.search = search(cur, !cached); };
+		})();
+	</script>
+	<script>
+		// ---- Load-stats comparison widget -------------------------------------------------
+		// Each page load renders ONE format (?src=), so a single run's stats only ever describe
+		// that format. recordTileStats() stashes every run's numbers in localStorage keyed by
+		// format; the Compare panel stacks them so reloading through several formats builds a
+		// side-by-side table -- grouped by category, with min/avg/max per metric across runs.
+
+		const STATS_KEY = "odin_tile_stats";
+
+		// Categories aren't encoded in tiles.odin -- derive from the format key prefix. Order
+		// here fixes the row order in the widget.
+		const CATEGORY_ORDER = ["Baseline", "ETC1S", "UASTC", "XUASTC", "XUBC7"];
+		function categoryOf(key) {
+			if (key === "avif" || key === "jpeg" || key === "jpeg-cdn") return "Baseline";
+			if (key.startsWith("etc1s"))  return "ETC1S";
+			if (key.startsWith("uastc"))  return "UASTC";
+			if (key.startsWith("xuastc")) return "XUASTC";
+			if (key.startsWith("xubc7"))  return "XUBC7";
+			return "Baseline";
+		}
+		// Current format from the URL -- same defaulting as the button IIFE (avif when absent).
+		function currentSrc() {
+			const raw = new URLSearchParams(location.search).get("src");
+			return TILE_FORMATS.includes(raw) ? raw : "avif";
+		}
+
+		// store shape: { [formatKey]: [ {k,f,d,t}, ... ] }  (one object per run)
+		//   k = download KiB   f = fetch avg ms   d = decode avg ms   t = wall-clock total ms
+		function readStore() {
+			try { return JSON.parse(localStorage.getItem(STATS_KEY)) || {}; }
+			catch { return {}; }
+		}
+		function writeStore(store) {
+			try { localStorage.setItem(STATS_KEY, JSON.stringify(store)); }
+			catch (e) { console.warn("stats persist failed", e); } // quota etc. -- never break the page
+		}
+
+		// Parse the compact #stats block (see print_stats in tiles.odin). Label-anchored so the
+		// optional "⚠ ...\n" warning prefix on the RGBA-fallback path doesn't shift anything.
+		function parseStats(text) {
+			const num = re => { const m = text.match(re); return m ? parseFloat(m[1]) : null; };
+			return {
+				k: num(/([\d.]+)\s*KiB/),
+				f: num(/fetch:\s+avg\s+([\d.]+)\s*ms/),
+				d: num(/decode:\s+avg\s+([\d.]+)\s*ms/),
+				t: num(/total:\s+([\d.]+)\s*ms/),
+			};
+		}
+
+		// Called from tiles_stats once a block finishes loading.
+		function recordTileStats(text) {
+			const s = parseStats(text);
+			// Skip if nothing parsed (guards against a format-string change upstream).
+			if (s.k == null && s.f == null && s.d == null && s.t == null) return;
+			const store = readStore();
+			(store[currentSrc()] ||= []).push(s);
+			writeStore(store);
+			if (!document.getElementById("compare").hidden) renderCompare();
+		}
+
+		// ---- rendering ----
+		const fmt = (v, dp) => (v == null ? "–" : v.toFixed(dp));
+		function agg(runs, field) { // -> {avg,min,max} over the runs that have this field
+			const xs = runs.map(r => r[field]).filter(v => v != null);
+			if (!xs.length) return null;
+			const sum = xs.reduce((a, b) => a + b, 0);
+			return { avg: sum / xs.length, min: Math.min(...xs), max: Math.max(...xs) };
+		}
+		// One metric column: <field key>, heading, decimal places.
+		const METRICS = [
+			{ key: "k", label: "KiB",       dp: 1 },
+			{ key: "f", label: "Fetch ms",  dp: 1 },
+			{ key: "d", label: "Decode ms", dp: 1 },
+			{ key: "t", label: "Total ms",  dp: 0 },
+		];
+
+		function renderCompare() {
+			const store = readStore();
+			const body = document.getElementById("compareBody");
+			const summary = document.getElementById("compareSummary");
+			const keys = Object.keys(store).filter(k => store[k] && store[k].length);
+			const totalRuns = keys.reduce((n, k) => n + store[k].length, 0);
+			summary.textContent = keys.length
+				? `${keys.length} formats · ${totalRuns} runs · lower is better`
+				: "";
+
+			if (!keys.length) {
+				body.innerHTML =
+					'<div class="empty">No runs captured yet — reload through some formats (the AVIF/JPEG/… buttons), then reopen this panel.</div>';
+				return;
+			}
+
+			// Best (lowest) avg per metric across ALL formats -> highlight the winner cell.
+			const best = {};
+			for (const m of METRICS) {
+				let b = Infinity;
+				for (const k of keys) { const a = agg(store[k], m.key); if (a && a.avg < b) b = a.avg; }
+				best[m.key] = b;
+			}
+
+			const cur = currentSrc();
+			let html = "<table><thead><tr><th class='fmt'>Format</th><th>Runs</th>" +
+				METRICS.map(m => `<th>${m.label}</th>`).join("") + "</tr></thead><tbody>";
+
+			for (const cat of CATEGORY_ORDER) {
+				// formats in this category that have data, kept in TILE_FORMATS order
+				const rows = TILE_FORMATS.filter(k => categoryOf(k) === cat && store[k] && store[k].length);
+				if (!rows.length) continue;
+				html += `<tr class="cat"><td colspan="${METRICS.length + 2}">${cat}</td></tr>`;
+				for (const k of rows) {
+					const runs = store[k];
+					const cls = k === cur ? ' class="cur"' : "";
+					html += `<tr${cls}><td class="fmt">${k}</td><td>${runs.length}</td>`;
+					for (const m of METRICS) {
+						const a = agg(runs, m.key);
+						if (!a) { html += "<td>–</td>"; continue; }
+						const isBest = Math.abs(a.avg - best[m.key]) < 1e-9;
+						const mm = runs.length > 1 ? `<span class="mm">${fmt(a.min, m.dp)}–${fmt(a.max, m.dp)}</span>` : "";
+						html += `<td class="${isBest ? "best" : ""}"><span class="v">${fmt(a.avg, m.dp)}</span>${mm}</td>`;
+					}
+					html += "</tr>";
+				}
+			}
+			html += "</tbody></table>";
+			body.innerHTML = html;
+		}
+
+		// ---- wiring ----
+		(() => {
+			const panel = document.getElementById("compare");
+			document.getElementById("compareBtn").onclick = () => {
+				panel.hidden = !panel.hidden;
+				if (!panel.hidden) renderCompare();
+			};
+			document.getElementById("compareClose").onclick = () => { panel.hidden = true; };
+			document.getElementById("compareClear").onclick = () => {
+				localStorage.removeItem(STATS_KEY);
+				renderCompare();
+			};
 		})();
 	</script>
 	<!-- Odin js_wasm32 runtime: runWasm + WasmMemoryInterface (attached to window.odin) -->
@@ -76,10 +300,6 @@
 		let webfileBuf = null; // bytes staged between webfile_fetch and webfile_copy
 		const webfileStash = {}; // id -> Uint8Array, staged between async fetch resolve and webfile_drain
 
-		// Summed tile work (ms): running sum of each tile's fetch + decode time, accumulated as
-		// tiles complete. Fed to the scheduler through tiles_now() so its "total" line reports
-		// summed work (sum of fetch + sum of decode) rather than wall-clock elapsed. Reset per (re)boot.
-		let tilesTotal = 0;
 
 		// Per-run accumulators for the #metrics panel. Totals are summed work (each tile's
 		// duration added up) -- with tiles fetching/decoding concurrently the sums exceed
@@ -103,6 +323,36 @@
 		// so the stats panel's fetch time is the number that should drop. no-store elsewhere
 		// (wasm, webfiles) is left alone on purpose.
 		const TILES_CACHED = new URLSearchParams(location.search).has("cached");
+
+		// Saved mosaic view from ?view=panX,panY,scale -- restored by the Odin scheduler on
+		// boot (see view_saved* imports). null if absent or malformed.
+		const savedView = (() => {
+			const v = new URLSearchParams(location.search).get("view");
+			if (!v) return null;
+			const [x, y, s] = v.split(",").map(Number);
+			return (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(s) && s > 0)
+				? { x, y, s } : null;
+		})();
+
+		// Persist the view to the URL, throttled: Odin calls scheduleViewSave on every pan/zoom
+		// (many per drag), so debounce the history write and use replaceState (no history spam).
+		// flushView() commits the latest immediately -- called before a source/cache switch and
+		// on pagehide, so a switch or a quick reload never drops the most recent zoom.
+		let pendingView = null, viewTimer = 0;
+		function flushView() {
+			if (!pendingView) return;
+			if (viewTimer) { clearTimeout(viewTimer); viewTimer = 0; }
+			const u = new URL(location.href);
+			u.searchParams.set("view", pendingView);
+			history.replaceState(null, "", u);
+			pendingView = null;
+		}
+		function scheduleViewSave(x, y, scale) {
+			pendingView = x.toFixed(2) + "," + y.toFixed(2) + "," + scale.toFixed(4);
+			if (viewTimer) return;
+			viewTimer = setTimeout(() => { viewTimer = 0; flushView(); }, 100);
+		}
+		addEventListener("pagehide", flushView); // keep the latest zoom on reload/close
 
 		// Cache ImageDecoder.isTypeSupported() per mime type: one probe, reused for every
 		// tile of that type. Resolves false when WebCodecs is unavailable or the type is
@@ -243,9 +493,7 @@
 								{ texture: tex, origin: [0, 0, layer] },
 								[w, h, 1]);
 							cleanup();
-							// Upload time is not tracked -- report 0. Add this tile's fetch + decode
-							// to the running total the scheduler reads via tiles_now().
-							tilesTotal += tFetch + decodeMs;
+							// Upload time is not tracked for the browser path -- report 0.
 							fetchTotal += tFetch; decodeTotal += decodeMs; tileCount++;
 							renderTileMetrics();
 							wmi.exports.tile_uploaded(id, 1, bytes, tFetch, decodeMs, 0, ctxPtr);
@@ -255,25 +503,31 @@
 							wmi.exports.tile_uploaded(id, 0, 0, 0, 0, 0, ctxPtr);
 						});
 				},
-				// Source select from ?src=: jpeg -> 1 (local JPEG, fair), jpeg-cdn -> 2 (basemap.at),
-				// anything else -> 0 (local AVIF, default).
-				tile_source: () => {
-					const s = new URLSearchParams(location.search).get("src");
-					return s === "jpeg" ? 1 : (s === "jpeg-cdn" ? 2 : 0);
-				},
+				// Format select from ?src=: index into TILE_FORMATS (== `formats` in tiles.odin), or
+				// -1 -> Odin defaults to 0 (avif). Every #ab button's data-src is one of these keys.
+				tile_format: () => TILE_FORMATS.indexOf(new URLSearchParams(location.search).get("src")),
 				// The Odin scheduler calls this with the formatted stats block once the tile block
 				// finishes loading; reveal the on-page panel.
 				tiles_stats: (ptr, len) => {
 					const el = document.getElementById("stats");
 					el.textContent = wmi.loadString(ptr, len);
 					el.hidden = false;
+					// Persist this run's numbers (parsed from the same block) so the Compare
+					// widget can stack them across reloads. Defined in the widget script below.
+					recordTileStats(el.textContent);
 				},
-				// The scheduler builds its "total" as tiles_now(end) - tiles_now(start). Return the
-				// running summed work instead of a real clock: it reads 0 before any tile finishes
-				// and (sum of fetch + sum of decode) once they all have, so the total becomes summed
-				// work. NOTE: the panel still labels that line "wall" -- fix the label in the Odin
-				// formatter if it matters.
-				tiles_now: () => tilesTotal,
+				// Real monotonic clock (ms). Used for the block's wall-clock "total" (tiles_now(end) -
+				// tiles_now(start)) AND by the wasm KTX path to time its decode + upload phases.
+				tiles_now: () => performance.now(),
+			},
+			// Shared pan/zoom view (package view): Odin pushes the current view here (throttled to
+			// the URL) and reads any ?view= back through these getters on boot.
+			view: {
+				view_persist: (x, y, scale) => scheduleViewSave(x, y, scale),
+				view_saved:   () => savedView ? 1 : 0,
+				view_saved_x: () => savedView ? savedView.x : 0,
+				view_saved_y: () => savedView ? savedView.y : 0,
+				view_saved_s: () => savedView ? savedView.s : 1,
 			},
 		};
 
@@ -290,7 +544,6 @@
 
 		async function boot(hot) {
 			hotReload = hot;
-			tilesTotal = 0; // reset the summed-work total for this (re)boot
 			fetchTotal = 0; decodeTotal = 0; tileCount = 0; // reset the metrics-panel accumulators
 			{ const m = document.getElementById("metrics"); if (m) m.hidden = true; }
 			const bytes = await (await fetch("engine.wasm", { cache: "no-store" })).arrayBuffer();
@@ -339,6 +592,11 @@
 			}
 			stamp = m;
 		}, 500);
+
+		// Mosaic view buttons -> exported Odin procs (JS appends ctxPtr, like step). Handlers
+		// read wmi.exports live, so they hit the current instance after a hot swap.
+		document.getElementById("oneToOneBtn").onclick = () => wmi.exports.view_snap_1to1(ctxPtr);
+		document.getElementById("fitBtn").onclick      = () => wmi.exports.view_reset(ctxPtr);
 
 		boot(false);
 	</script>
